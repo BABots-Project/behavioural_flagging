@@ -1,12 +1,18 @@
 import os
 import cv2
+import h5py
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage.morphology import skeletonize
+from scipy import special
+from scipy.ndimage import binary_fill_holes
+from skimage.morphology import skeletonize, remove_small_objects, remove_small_holes, thin
 from skimage.util import invert
 
+img_threshold = 80
+small_object_size = 100
 
 def get_all_frame_paths(path, extension=".jpg"):
+    print("There is this many files: ", len([f for f in os.listdir(path) if f.endswith(extension)]))
     return sorted([f for f in os.listdir(path) if f.endswith(extension)])#, key=lambda x: int(x.split('.')[0].split('_')[-1]), reverse=True)
 
 
@@ -44,15 +50,21 @@ def get_solidity(worm, picture):
     hull_area = cv2.contourArea(hull)
     assert hull_area>0, "Hull area 0! oh oh!"
     solidity = float(area) / hull_area
-    return solidity
+    return solidity, thresh
 
 def get_thresholded_img(path, is_inverted):
-    img = cv2.imread(path)
+    if type(path)==str:
+        img = cv2.imread(path) # skip loading for hdf5
+    else:
+        img = path
     #img = cv2.fastNlMeansDenoising(img, None)
     #print("converting and splitting")
+    if len(img.shape) == 2:  # Grayscale image (single channel)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_channel, a, b = cv2.split(lab)
-
+    plt.imshow(img)
+    plt.show()
     # Applying CLAHE to L-channel
     # feel free to try different values for the limit and grid size:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -69,21 +81,38 @@ def get_thresholded_img(path, is_inverted):
     #bg = restoration.rolling_ball(gray)
     #gray = gray - bg
     # Apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0) #(17,17), 0 for omegas
+    blurred = cv2.GaussianBlur(gray, (17, 17), 0) #(17,17), 0 for omegas
 
     # Enhance contrast using CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(13, 13)) #2.0, (13,13) for omegas
     enhanced = clahe.apply(blurred)
     #plt.imshow(enhanced)
     #plt.show()
-    ret, thresh = cv2.threshold(enhanced, 110, 255, cv2.THRESH_BINARY)  # + cv2.THRESH_OTSU)
+    ret, thresh = cv2.threshold(enhanced, img_threshold, 255, cv2.THRESH_BINARY)  # + cv2.THRESH_OTSU)
     #thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 119, 7)
+    plt.imshow(thresh)
+    plt.show()
     return thresh, img
 
 def eq_dia(cnt):
     area = cv2.contourArea(cnt)
     equi_diameter = np.sqrt(4 * area / np.pi)
     return equi_diameter
+
+def get_first_frame_from_hdf5(hdf5_file):
+    with h5py.File(hdf5_file, "r") as f:
+        for name in f.keys():
+            print(name)
+        first_frame = f["/full_data"][0]  # Load only the first frame
+    show = False
+    if show:
+        cv2.imshow("First Frame", first_frame)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    return first_frame
+
+
+
 
 def calculate_worm_size(image_path, worm):
     """
@@ -94,11 +123,26 @@ def calculate_worm_size(image_path, worm):
     Output:
         Worm length in mm.
     """
+
+
     thresh, img = get_thresholded_img(path=image_path, is_inverted=worm.invert_color)
+    plt.imshow(thresh)
+    plt.title("thresholded img")
+    plt.show()
     # Skeletonize the binary image
-    skeleton = skeletonize(invert(thresh))  # Convert binary to boolean for skimage
+    #thresh = remove_small_objects(thresh, min_size=150, connectivity=2)
+    thinned = thin(invert(thresh))
+    thinned = remove_small_objects(thinned, min_size=small_object_size, connectivity=2)
+    skeleton = skeletonize(thinned)  # Convert binary to boolean for skimage
+    skeleton = binary_fill_holes(skeleton)
+    skeleton = skeletonize(skeleton)
+
     # Count the number of pixels in the skeleton
+    plt.imshow(skeleton)
+    plt.title("skeleton img")
+    plt.show()
     pixel_count = np.sum(skeleton)
+    print("there are this many pixels in length: ", pixel_count)
     # Convert to mm
     worm_length_mm = pixel_count * worm.pixel_to_mm_ratio
 
@@ -129,6 +173,8 @@ def calculate_reversals(data, animal_size_um, angle_threshold, scale=1.0):
     data['velocity'] = np.sqrt(
         (data['X_um'].diff() ** 2) + (data['Y_um'].diff() ** 2)
     ) / data['time_diff']
+    data = data.fillna(0)
+    print("upon inspection, the mean velocity is: ", data['velocity'].quantile(0.25))
 
     # Calculate cumulative distance traveled by the centroid
     data['distance'] = data['velocity'].cumsum()
@@ -168,3 +214,39 @@ def calculate_reversals(data, animal_size_um, angle_threshold, scale=1.0):
     data['reversals'] = 0
     data.loc[reversal_indices, 'reversals'] = 1
     return data
+
+def visualize_crawl_clusters(concordances, curvatures, labels, centers, n_clusters):
+    plt.close()
+    fig, axs = plt.subplots(1, n_clusters-1, figsize=(8*(n_clusters-1), 8))
+    for i in range(n_clusters-1):
+        axs[i].scatter(concordances, np.log(curvatures), c=labels[i])
+        axs[i].scatter(centers[i][:, 0], centers[i][:, 1], c="black", s=100)
+        axs[i].set_title(f'k={i}')
+        axs[i].set_xlabel('Angular concordance')
+        axs[i].set_ylabel('Curvature (ln(k))')
+    plt.show()
+
+
+def visualize_single_crawl_cluster(concordances, curvatures, labels, centers):
+    plt.close()
+    plt.scatter(concordances, np.log(curvatures), c=labels)
+    plt.scatter(centers[:, 0], centers[:, 1], c="black", s=100)
+
+    plt.xlabel('Angular concordance')
+    plt.ylabel('Curvature (ln(k))')
+    plt.show()
+
+SQRT2 = 1.41421356237
+
+def LNquantile(velocity, p):
+    """
+    Compute quantile function for log-normal distribution
+    """
+    μ = np.mean(velocity)
+    σ = np.std(velocity)**2
+    print(f'found mu {μ} and sigma {σ}')
+    nq = SQRT2 * special.erfinv(2.0*p - 1.0) # N(0,1) normal quantile
+    print(f'nq {nq}')
+    t = μ +  σ * nq # N(μ, σ) quantile
+    return np.exp(t) # LN(μ, σ) quantile
+
